@@ -1,0 +1,348 @@
+---
+title: "Full Alpha Trimming Simulation Study"
+author: "Nikola Surjanovic"
+date: "10/05/2023"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+rm(list=ls())
+overwrite <- TRUE
+```
+
+```{r}
+batch <- 4L # 0=All, 1=First quarter, ..., 4=Fourth quarter (if num.cores = 4, otherwise it is in "thirds")
+num.cores <- 4L # 3 or 4
+# Note: try not to use more than 4 cores because training takes up a notable 
+# amount of memory with the current implementation.
+```
+
+
+
+# Assess Performance via Cross-Validation
+
+## Define Useful Functions
+
+```{r}
+Import.Data <- function(data.name) {
+  X <- read.table(file=paste0("data/", data.name, "/x.txt"), header=FALSE, sep="")
+  y <- as.numeric(read.table(file=paste0("data/", data.name, "/ytrans.txt"), header=FALSE, sep="")$V1)
+  
+  info <- read.table(file=paste0("data/", data.name, "/info.txt"), header=TRUE, sep="")$var_type
+  info <- info[1:(length(info)-1)]
+  if (length(info) != ncol(X)) warning("Length of 'info' is not equal to the number of columns in 'X'.")
+  
+  for (j in 1:ncol(X)) {
+    if (info[j] == "n") {
+      X[, j] <- as.numeric(X[, j])
+    } else if (info[j] == "c") {
+      X[, j] <- as.factor(X[, j])
+    } else {
+      warning("Unrecognized variable format in 'info'.")
+    }
+  }
+  
+  dat <- as.data.frame(cbind(y,X))
+  return(dat)
+}
+```
+
+```{r}
+Train.Models <- function(dat, folds, r, v, num.trees, mtry.vec, RFtrim.mns, alpha.vec, mns.vec) {
+  mod.list <- vector(mode='list', length=3L)
+  names(mod.list) <- c("RFtrim_BIC", "RF_Best", "RF5")
+  
+  
+  # Train alpha-trimmed random forests ---
+  bic.mspe <- .Machine$double.xmax
+  bic.alpha.min <- NA
+  bic.mtry <- NA
+  for (mtry in mtry.vec) {
+    rf.mod <- ranger::ranger(y ~ ., data=dat[folds[, r] != v, ], write.forest=TRUE, min.node.size=RFtrim.mns, 
+                             num.trees=num.trees, oob.error=TRUE, keep.inbag=TRUE, max.depth=NULL, mtry=mtry)
+    
+    bic.rf <- alpha.trim.tune(rf.mod, ycol=which(colnames(dat)=="y"), criterion="BIC", alpha=alpha.vec)
+    
+    if (min(bic.rf$oob.mspe) < bic.mspe) {
+      bic.mspe <- min(bic.rf$oob.mspe)
+      mod.list[["RFtrim_BIC"]] <- bic.rf$object.trim.min
+      bic.alpha.min <- bic.rf$alpha.min
+      bic.mtry <- mtry
+    }
+  }
+  rm(rf.mod)
+  
+  
+  # Train a tuned random forest ---
+  rf.tuned.mspe <- .Machine$double.xmax
+  rf.best.mns <- NA
+  rf.best.mtry <- NA
+  for (mtry in mtry.vec) {
+    for (mns in mns.vec) {
+      rf.mod <- ranger::ranger(y ~ ., data=dat[folds[, r] != v, ], write.forest=TRUE, min.node.size=mns, 
+                               num.trees=num.trees, oob.error=TRUE, keep.inbag=FALSE, max.depth=NULL, mtry=mtry)
+      if (rf.mod$prediction.error < rf.tuned.mspe) {
+        rf.tuned.mspe <- rf.mod$prediction.error
+        mod.list[["RF_Best"]] <- rf.mod
+        rf.best.mns <- mns
+        rf.best.mtry <- mtry
+      }
+    }
+  }
+  rm(rf.mod)
+
+  
+  # Train a "vanilla" random forest ---
+  mod.list[["RF5"]] <- ranger::ranger(y ~ ., data=dat[folds[, r] != v, ], write.forest=TRUE, min.node.size=5L, 
+                                      num.trees=num.trees, oob.error=TRUE, keep.inbag=FALSE, max.depth=NULL, mtry=NULL)
+  
+  
+  tune.info <- c(bic.alpha.min, bic.mtry, rf.best.mns, rf.best.mtry)
+  names(tune.info) <- c("RFtrim_BIC_alpha", "RFtrim_BIC_mtry", "RF_Best_mns", "RF_Best_mtry")
+  
+  return(list(mod.list = mod.list,
+              tune.info = tune.info))
+}
+```
+
+```{r}
+Make.Predictions <- function(mod.list, preds, dat, folds, r, v) {
+  inds <- which(folds[, r] == v)
+  preds[inds, "RFtrim_BIC"] <- predict(mod.list[["RFtrim_BIC"]], data=dat[inds, ])
+  preds[inds, "RF_Best"] <- predict(mod.list[["RF_Best"]], data=dat[inds, ])$predictions
+  preds[inds, "RF5"] <- predict(mod.list[["RF5"]], data=dat[inds, ])$predictions
+  return(preds)
+}
+```
+
+```{r}
+Make.Metrics <- function(preds.list) {
+  R <- length(preds.list[[1]])
+  data.names <- names(preds.list)
+  mod.names <- c("RFtrim_BIC", "RF_Best", "RF5")
+  mod.names.rel <- paste0(mod.names, "_rel")
+  
+  
+  # Obtain information about RMSPEs and relative RMSPEs ---
+  raw.rmspe <- vector(mode='list', length=length(data.names))
+  for (data.name in data.names) {
+    raw.rmspe[[data.name]] <- vector(mode='list', length=2*length(mod.names))
+    names(raw.rmspe[[data.name]]) <- c(mod.names, mod.names.rel)
+    
+    for (mod in mod.names) {
+      raw.rmspe[[data.name]][[mod]] <- numeric(R)
+      raw.rmspe[[data.name]][[paste0(mod, "_rel")]] <- numeric(R)
+      
+      for (r in 1:R) {
+        raw.rmspe[[data.name]][[mod]][r] <- sqrt(mean((preds.list[[data.name]][[r]]$Y - preds.list[[data.name]][[r]][, mod])^2))
+      }
+    }
+    
+    
+    for (r in 1:R) {
+      min.rmspe <- .Machine$double.xmax
+      for (mod in mod.names) {
+        if (raw.rmspe[[data.name]][[mod]][r] < min.rmspe) {
+          min.rmspe <- raw.rmspe[[data.name]][[mod]][r]
+        }
+      }
+      
+      for (mod in mod.names) {
+        raw.rmspe[[data.name]][[paste0(mod, "_rel")]][r] <- raw.rmspe[[data.name]][[mod]][r]/min.rmspe
+      }
+    }
+  }
+  
+  
+  # Make the 'metrics' data frame ---
+  metrics <- as.data.frame(matrix(NA, nrow=length(data.names), ncol=4*length(mod.names) + 5))
+  colnames(metrics) <- c("Data", mod.names, mod.names.rel, paste0(mod.names, "_SD"), paste0(mod.names.rel, "_SD"), 
+                         "RF5.BIC", "RF5.BIC_SD", "RF_Best.BIC", "RF_Best.BIC_SD")
+  metrics$Data <- data.names
+  
+  for (data.name in data.names) {
+    for (mod in c(mod.names, mod.names.rel)) {
+      metrics[which(metrics$Data == data.name), mod] <- mean(raw.rmspe[[data.name]][[mod]])
+      metrics[which(metrics$Data == data.name), paste0(mod, "_SD")] <- sd(raw.rmspe[[data.name]][[mod]])
+    }
+    
+    metrics[which(metrics$Data == data.name), "RF5.BIC"] <- 
+      mean(raw.rmspe[[data.name]][["RF5"]]/raw.rmspe[[data.name]][["RFtrim_BIC"]])
+    metrics[which(metrics$Data == data.name), "RF5.BIC_SD"] <- 
+      sd(raw.rmspe[[data.name]][["RF5"]]/raw.rmspe[[data.name]][["RFtrim_BIC"]])
+    
+    metrics[which(metrics$Data == data.name), "RF_Best.BIC"] <- 
+      mean(raw.rmspe[[data.name]][["RF_Best"]]/raw.rmspe[[data.name]][["RFtrim_BIC"]])
+    metrics[which(metrics$Data == data.name), "RF_Best.BIC_SD"] <- 
+      sd(raw.rmspe[[data.name]][["RF_Best"]]/raw.rmspe[[data.name]][["RFtrim_BIC"]])
+  }
+
+  metrics$Data <- as.factor(metrics$Data)
+  return(metrics)
+}
+```
+
+
+
+## Start Analysis
+
+```{r}
+# Ctrl + Shift + L first!
+library(ranger)
+```
+
+```{r}
+# Global simulation settings
+num.trees <- 750L # 500 is the default in 'ranger'
+RFtrim.mns <- 3L # 5 is the default in 'ranger'
+alpha.vec <- seq(0, 3.0, 0.1)
+```
+
+```{r}
+data.names <- list.dirs(path="data", recursive=FALSE, full.names=FALSE)
+
+if (num.cores == 4L) {
+  if (batch == 1L) {
+    data.names <- data.names[1:which(data.names=="Budget")]
+  } else if (batch == 2L) {
+    data.names <- data.names[(which(data.names=="Budget")+1):which(data.names=="Fat")]
+  } else if (batch == 3L) {
+    data.names <- data.names[(which(data.names=="Fat")+1):which(data.names=="Laheart")]
+  } else if (batch == 4L) {
+    data.names <- data.names[(which(data.names=="Laheart")+1):length(data.names)]
+  }
+} else if (num.cores == 3L) {
+  if (batch == 1L) {
+    data.names <- data.names[1:which(data.names=="Cane")]
+  } else if (batch == 2L) {
+    data.names <- data.names[(which(data.names=="Cane")+1):which(data.names=="Insur")]
+  } else if (batch == 3L) {
+    data.names <- data.names[(which(data.names=="Insur")+1):length(data.names)]
+  }
+}
+
+preds.list <- vector(mode='list', length=length(data.names))
+names(preds.list) <- data.names
+tune.info.list <- vector(mode='list', length=length(data.names))
+names(tune.info.list) <- data.names
+```
+
+```{r}
+for (data.name in data.names) {
+  dat <- Import.Data(data.name=data.name)
+  n <- nrow(dat)
+  p <- ncol(dat) - 1
+  
+  mtry.vec <- unique(c(1, max(1, floor(sqrt(p))), max(1, floor(p/3)), max(1, floor(2*p/3)), max(1, p-1)))
+  mns.vec <- unique(floor(2*(n/2)^(0:30/30)))
+  
+  folds <- read.table(file=paste0("data/", data.name, "/partitions.txt"), header=FALSE, sep="")
+  V <- max(folds[, 1]) + 1
+  folds <- folds[, 1:10] # only do 10 repetitions for now!
+  R <- ncol(folds)
+  
+  tune.info <- array(NA, dim=c(V, 4L, R))
+  colnames(tune.info) <- c("RFtrim_BIC_alpha", "RFtrim_BIC_mtry", "RF_Best_mns", "RF_Best_mtry")
+  
+  for (r in 1:R) { # Number of CVs
+    preds <- data.frame(Y=dat$y, r=r, RFtrim_BIC=NA, RF_Best=NA, RF5=NA)
+    for (v in 0:(V-1)) { # Number of folds
+      tm <- Train.Models(dat=dat, folds=folds, r=r, v=v, num.trees=num.trees, mtry.vec=mtry.vec, 
+                               RFtrim.mns=RFtrim.mns, alpha.vec=alpha.vec, mns.vec=mns.vec)
+      mod.list <- tm$mod.list
+      preds <- Make.Predictions(mod.list=mod.list, preds=preds, dat=dat, folds=folds, r=r, v=v)
+      tune.info[(v+1), ,r] <- tm$tune.info
+      print(paste0("Data=", data.name, ", r=", r, ", v=", v))
+    }
+    # print(paste0("Data=", data.name, ", r=", r))
+    preds.list[[data.name]][[r]] <- preds
+  }
+  tune.info.list[[data.name]] <- tune.info
+}
+```
+
+```{r}
+file <- paste0("sim_data/preds_list_", batch, ".rds")
+if (!file.exists(file) | overwrite)
+  save(preds.list, file=file)
+
+file <- paste0("sim_data/tune_info_list_", batch, ".rds")
+if (!file.exists(file) | overwrite)
+  save(tune.info.list, file=file)
+```
+
+
+
+## Merge Data (do after running all of above)
+
+```{r}
+date_str <- "aug_8_2024"
+
+load(paste0("sim_data/", date_str, "/preds_list_1.rds"))
+preds.list.1 <- preds.list
+
+load(paste0("sim_data/", date_str, "/preds_list_2.rds"))
+preds.list.2 <- preds.list
+
+load(paste0("sim_data/", date_str, "/preds_list_3.rds"))
+preds.list.3 <- preds.list
+
+load(paste0("sim_data/", date_str, "/preds_list_4.rds"))
+preds.list.4 <- preds.list
+
+preds.list <- c(preds.list.1, preds.list.2, preds.list.3, preds.list.4)
+```
+
+```{r}
+metrics <- Make.Metrics(preds.list)
+```
+
+
+
+
+# Make Plots (Note: paper plots moved to Julia)
+
+```{r}
+criterion <- "BIC"
+
+for (mod in c("RF5", "RF_Best")) {
+  plot.order <- order(-metrics[, paste0(mod,".", criterion)])
+  
+  CI.data <- as.data.frame(matrix(NA, ncol=5, nrow=nrow(metrics)))
+  colnames(CI.data) <- c("Point", "SD", "Lower", "Upper", "Colour")
+  CI.data[, "Point"] <- as.numeric(metrics[plot.order, paste0(mod,".", criterion)])
+  CI.data[, "SD"] <- as.numeric(metrics[plot.order, paste0(mod,".", criterion, "_SD")])
+  CI.data[, "Lower"] <- as.numeric(CI.data[, "Point"] - 1.96*CI.data[, "SD"])
+  CI.data[, "Upper"] <- as.numeric(CI.data[, "Point"] + 1.96*CI.data[, "SD"])
+  
+  for (i in 1:nrow(CI.data)) {
+    if (CI.data[i, "Lower"] > 1) {
+      colour.string <- "blue"
+    } else if ((CI.data[i, "Lower"] <= 1) & (CI.data[i, "Upper"] >= 1)) {
+      colour.string <- "orange"
+    } else if (CI.data[i, "Upper"] < 1) {
+      colour.string <- "red"
+    }
+    CI.data[i, "Colour"] <- colour.string
+  }
+  
+  plot(x=1:nrow(metrics), y=metrics[plot.order, paste0(mod,".", criterion)], 
+       type='p', cex=0.5, xaxt="n", xlab="", ylab="RMSPE Ratio", 
+       main=paste0("RMSPE Ratio Between ", mod, " and Alpha-Trimmed RF (", criterion, ")"),
+       ylim=c(min(CI.data[, "Lower"]), max(CI.data[, "Upper"])))
+  for (i in 1:nrow(metrics)) {
+    segments(x0=i, y0=CI.data[i, "Lower"], y1=CI.data[i, "Upper"], col=CI.data[i, "Colour"])
+  }
+  axis(1, at=1:nrow(metrics), labels=metrics$Data[plot.order], las=2)
+  abline(h=1, lty=3)
+  
+  # export data
+  full_data <- cbind(CI.data, metrics$Data[plot.order])
+  colnames(full_data)[6] <- "name"
+  write.csv(full_data, paste0("plots/data_for_julia/fullsim_", mod, "_", criterion, ".csv"))
+}
+```
+
+
+

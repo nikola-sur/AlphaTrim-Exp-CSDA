@@ -1,0 +1,2 @@
+column. var_name. var_type
+1 x1 n
